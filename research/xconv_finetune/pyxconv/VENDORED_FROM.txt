@@ -1,0 +1,8 @@
+Vendored from luqigroup/xconv_pv @ 9abb660 (Integrate useful changes from other local repo)
+
+Local patches applied to this vendored snapshot (logic byte-identical otherwise):
+  - __init__.py: dropped `from .mem_logger import *` (mem_logger needs nvidia_smi,
+    an optional GPU profiler unused by this experiment).
+  - funcs.py / probe.py / utils.py: removed the unused `from IPython import embed`
+    debug imports so the package imports in a minimal env.
+Re-vendor from ~/Codes/xconv_pv to pick up upstream changes.
