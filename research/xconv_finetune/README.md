@@ -1,81 +1,87 @@
-# XConv finetuning of a 3D SegResNet on Spleen
+# XConv finetuning of the MONAI spleen UNet — memory comparison
 
-Memory-vs-probing study for low-memory backpropagation (XConv) when **finetuning
-the convolutional layers** of a 3D segmentation network.
+Finetune the **pretrained** `spleen_ct_segmentation` MONAI bundle **with and
+without XConv**, and compare **true GPU peak memory**. No pretraining (the init is
+the bundle's `models/model.pt`) and no custom pipeline — the UNet, `DiceCELoss`,
+`Novograd`, `StepLR`, and data all come from the bundle's `configs/train.json`.
+XConv only swaps the convolutions for a probed, low-memory weight gradient.
 
-- **Task**: MSD Task09 Spleen (CT, 1 channel, binary segmentation).
-- **Model**: MONAI `SegResNet` (regular `Conv3d` throughout — the case XConv's
-  probed weight-gradient supports).
-- **Claim under test**: at a fixed batch size, replacing every `Conv3d` with
-  `Xconv3D` lowers activation memory; the freed memory buys a larger probing
-  count `ps` (less gradient noise) while still fitting the GPU.
+## REQUIRED: use the boundary-fixed pyxconv (branch `ali`)
 
-## Layout (one concept per file)
+`import pyxconv` must resolve to the in-house package on the **`ali`** branch of
+`~/Codes/xconv_pv`, which fixes the probe's boundary bias (the backward used a
+circular `roll` that estimated the *circular*-conv gradient, biasing it ~20–45%
+for k>1 vs the zero-padded conv). The `ali` branch is **padding-aware for both 2D
+and 3D**. Install it **editable** so any further upstream fixes are picked up
+automatically (do **not** vendor/copy — it goes stale):
+
+```bash
+pip install -e ~/Codes/xconv_pv          # branch ali; --no-deps if you must not touch torch
+python -c "import pyxconv; print(pyxconv.__file__)"   # must point inside ~/Codes/xconv_pv
+```
+
+Env: the `sips` conda env (`/home/al289197/miniconda3/envs/sips`), torch 2.9 +
+CUDA, MONAI 1.5.2, `pynvml`.
+
+## The two comparisons (exact commands)
+
+Run from this directory. Memory is the **true NVML** device peak (CUDA context +
+reserved pool + cuDNN workspace), not `torch.cuda.max_memory_allocated`.
+
+```bash
+# 1) BASELINE — finetune the pretrained UNet with regular Conv3d, repo recipe
+#    (Novograd lr=0.002, StepLR(5000,0.1), DiceCELoss). Records the NVML peak = ceiling.
+python run.py --method baseline --batch 64 --max_steps 60
+#    -> results/baseline_unet_spleen_b64.json   (field: nvml_peak_gb)
+
+# 2) XCONV — same batch, probed convs. Pick the largest probing count r whose
+#    NVML peak stays <= the baseline's, then finetune at that r.
+python calibrate.py --batch 64 --rs 128,256,384,512        # -> largest r with NVML <= baseline
+python run.py --method xconv --batch 64 --ps <R> --max_steps 60
+#    -> results/xconv_unet_spleen_b64_r<R>_independent_conv.json
+```
+
+Both JSONs carry `nvml_peak_gb`, the conv-update proof, and (for XConv)
+`convert_preserved_max_delta` (must be 0 — conversion preserves the pretrained
+init). Compare the two `nvml_peak_gb`: **XConv must be ≤ baseline.**
+
+### Choosing the batch
+
+XConv's footprint is nearly **batch-independent** (the probe `e=(spatial×r)` does
+not grow with batch) while the baseline grows ~linearly, so XConv only wins at
+**larger batch**. `sweep_batch.py` locates the crossover:
+
+```bash
+python sweep_batch.py --r 256 --batches 8,16,32,64,96    # baseline vs xconv NVML peak per batch
+```
+On this UNet (patch 96, 16 GB card) the crossover is ~batch 64; both OOM by 96
+(the UNet's skip connections pin the high-res activations, which XConv cannot
+compress). Use batch 64 as the operating point above.
+
+## Files (committed)
 
 | file | role |
 |---|---|
-| `config.py` | flat hyperparameter namespace + CLI |
-| `data.py` | Spleen loaders, transforms, synthetic batch for probing |
-| `model.py` | build SegResNet, apply XConv, conv-layer introspection/update checks |
-| `memory.py` | peak-memory measurement, `find_max_batch`, `find_max_ps` |
-| `engine.py` | loss, train step, finetune loop, conv-update verify, Dice eval |
-| `finetune.py` | `run(cfg)` orchestration (size → finetune → verify → record) |
-| `train_baseline.py` / `train_xconv.py` | thin drivers |
-| `pyxconv/` | vendored probed-conv layers (`Xconv2D/3D`, `convert_net`) |
-
-## Run (three steps)
-
-```bash
-cd research/xconv_finetune
-
-# 0) pretrain a plain SegResNet on Spleen -> a checkpoint to finetune FROM
-python pretrain.py --pretrain_steps 200 --patch 96      # -> results/pretrained_segresnet_p96_f16.pth
-CKPT=results/pretrained_segresnet_p96_f16.pth
-
-# 1) baseline finetune (regular Conv3d), batch B0 sized to fit 16 GB
-python train_baseline.py --pretrained_ckpt $CKPT --max_steps 60
-
-# 2) xconv finetune: maximize the probing count r (=ps), dropping batch as needed
-python train_xconv.py    --pretrained_ckpt $CKPT --max_steps 60
-```
-
-Each run writes a JSON summary (resolved batch/`r`, peak GB, conv-update proof,
-init-preservation delta, Dice) to `results/`; the loss curve goes to a `.npy`.
-
-## Initialization is preserved through conversion (verified)
-
-The user-critical invariant: **`convert_net` must not destroy the pretrained
-init.** It does not — it reuses each conv's existing weight `Parameter`. The
-pipeline enforces the safe order **build → load pretrained → convert**, then
-`assert_convert_preserved` hard-checks every conv weight is identical after
-conversion (`convert_preserved_max_delta == 0`). Only a cross-task output head
-(shape mismatch) is skipped, and `load_pretrained` reports it.
-
-## Sizing: maximize r, drop batch as needed (`size_strategy='max_ps'`, default)
-
-The baseline fixes the largest batch `B0` that fits 16 GB. The XConv run then
-**maximizes `r`** by scanning batches from `B0` down to 1, taking the largest `r`
-that fits and keeping the *largest* batch that reaches it (batch drops only as far
-as a strictly larger `r` requires). `--size_strategy fixed_batch` instead holds
-`B0` and maximizes `r` at it.
+| `bundle.py` | load the bundle's pretrained UNet, loss, lr, scheduler, data loader |
+| `xconv_ops.py` | swap Conv3d→Xconv3D, conv introspection, init-preservation guard |
+| `gpu_mem.py` | true GPU peak via NVML polling (`NvmlPeak`) |
+| `memory.py` | torch-allocator sizing helpers (`find_max_ps`, `maximize_ps`) |
+| `engine.py` | train step + finetune loop (pure) |
+| `run.py` | CLI: finetune a method, record NVML peak + conv-update + preservation |
+| `calibrate.py` | largest `r` whose NVML peak ≤ baseline (the operating-point picker) |
+| `sweep_batch.py` | baseline-vs-XConv NVML peak across batch (finds the crossover) |
 
 ## Notes / caveats
 
-- **Finetuning trains the convs (magnitude-checked)**: `Δ>0` is not proof (AdamW
-  weight decay moves weights with a zero gradient). The run reports
-  `convs_gradient_trained` only when the min relative conv update exceeds the
-  weight-decay-only drift (`lr*wd*steps`) by a wide margin.
-- **`r` is the memory/gradient-noise knob, and 3D is demanding**:
-  `check_xconv_grad.py` shows the forward is exact and the probed gradient is
-  unbiased in direction, but at large 3D maps a modest `r` is very noisy — cos ~ 0
-  at 48^3 with r=256. Early high-resolution layers need a large `r`; that is why
-  we maximize it.
-- **XConv is PyTorch-only and dense-conv-only here**: SegResNet convs are
-  `groups=1` (required — the in-house 3D weight-grad probe is dense-only; 2D adds
-  grouped/depthwise). Do not point `convert_net` at depthwise/separable nets.
-- **`xmode='independent'`** gave the cleanest gradient direction (and is required
-  for the grouped 2D path); `gaussian` is the upstream default.
-- Default `xconv_target='conv'` converts only convolutions; `'all'` also swaps
-  ReLU for memory-saving `BReLU`.
-- Vendored `pyxconv/` is a snapshot of `luqigroup/xconv_pv`
-  (`pyxconv/VENDORED_FROM.txt`); re-vendor for upstream changes.
+- **XConv beats *exact-conv* memory only with BReLU.** With ReLU left exact
+  (`--xconv_target conv`, the default), XConv only *matches* exact-conv memory —
+  the stored activations are pinned by the activation, not the conv. The in-house
+  paper uses BReLU (`mode='all'`) to turn this into a saving. **The MONAI spleen
+  UNet uses PReLU**, which `BReLU` does not convert, so `--xconv_target all` does
+  not help here; expect XConv ≈ baseline (a win only past the batch crossover).
+- **Boundary fix** lives in `pyxconv` (branch `ali`), 2D **and** 3D — verified
+  upstream (`verify_fix2.py`). Memory results do not depend on it; gradient
+  fidelity does.
+- **`r` is the memory/gradient-noise knob**; `xmode='independent'` is the cleanest
+  probe and the one used here.
+- The bundle + Spleen data auto-download to `bundles/` and `data/` on first use.

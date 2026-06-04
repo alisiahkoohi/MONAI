@@ -152,6 +152,7 @@ def maximize_ps(
     budget_gb: float,
     max_batch: int,
     batch_ladder: tuple[int, ...] = (16, 12, 8, 6, 4, 3, 2, 1),
+    min_batch: int = 1,
     margin: float = 0.9,
 ) -> tuple[int, int, float]:
     """Maximize the probing count ``ps`` (``r``), dropping batch only as needed.
@@ -164,7 +165,8 @@ def maximize_ps(
 
     Returns ``(ps, batch, peak_gb)``.
     """
-    batches = sorted({b for b in batch_ladder if 1 <= b <= max_batch} | {1}, reverse=True)
+    batches = sorted({b for b in batch_ladder if min_batch <= b <= max_batch} | {min_batch},
+                     reverse=True)
     best_ps, best_b, best_mem = 0, 0, 0.0
     for b in batches:
         try:
