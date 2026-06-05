@@ -1,5 +1,7 @@
 # XConv finetuning of the MONAI spleen UNet — memory comparison
 
+**Run (from `research/xconv_finetune/`):** `python run.py --method baseline --batch <B> --max_steps 60` and `python run.py --method xconv --batch <B> --ps <R> --max_steps 60` (`<B>` = batch, `<R>` = probing count from `calibrate.py`).
+
 Finetune the **pretrained** `spleen_ct_segmentation` MONAI bundle **with and
 without XConv**, and compare **peak GPU memory**. No pretraining (the init is
 the bundle's `models/model.pt`) and no custom pipeline — the UNet, `DiceCELoss`,
