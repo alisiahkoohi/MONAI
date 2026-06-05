@@ -58,6 +58,27 @@ On this UNet (patch 96, 16 GB card) the crossover is ~batch 64; both OOM by 96
 (the UNet's skip connections pin the high-res activations, which XConv cannot
 compress). Use batch 64 as the operating point above.
 
+## AGE + peak-memory figures (the rad-vs-xconv methodology)
+
+`age_memory.py` produces the two canonical figures for this example, reusing the
+in-house `radcompare` metrics verbatim (so numbers match the paper methodology):
+**Average Gradient Error** (paper Eq. 9, `radcompare.age`) and **peak memory**
+(`radcompare.memory.peak_memory_mib` — `torch_peak` via the repo `MemoryTracker`
+with a 2-iteration warm-up). It sweeps the probing count `r` at the bundle's
+native 96³ patch and a fixed batch, on the pretrained UNet:
+
+```bash
+python age_memory.py --rs 2,4,8,16,32,64,128,256 --batch 8 --subset 64 --n_runs 3
+#  -> results/age_memory/{age_vs_r,peak_memory_vs_r}.{pdf,png} + age_memory.json
+```
+
+- **AGE vs r**: XConv's gradient error decays toward the exact sampling floor as
+  `r` grows — no residual plateau (the `ali` boundary fix makes it unbiased).
+- **Peak memory vs r**: XConv vs the exact-baseline line (where it stays ≤ exact).
+- AGE uses a **fixed** set of spleen patches (cropped once); peak memory uses
+  random 3D inputs of the same shape. `--synthetic`/`--skip_memory` give a
+  CPU-only smoke. Figures use the repo paper theme (`radcompare.plotting`).
+
 ## Files (committed)
 
 | file | role |
@@ -70,6 +91,7 @@ compress). Use batch 64 as the operating point above.
 | `run.py` | CLI: finetune a method, record NVML peak + conv-update + preservation |
 | `calibrate.py` | largest `r` whose NVML peak ≤ baseline (the operating-point picker) |
 | `sweep_batch.py` | baseline-vs-XConv NVML peak across batch (finds the crossover) |
+| `age_memory.py` | AGE + peak-memory vs `r` (reuses `radcompare`; paper figures) |
 
 ## Notes / caveats
 

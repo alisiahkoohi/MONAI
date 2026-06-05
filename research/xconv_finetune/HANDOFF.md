@@ -78,9 +78,11 @@ re-reviewed).
 | Spleen data (downloaded) | `research/xconv_finetune/data/Task09_Spleen/` (gitignored) |
 | Bundle (downloaded) | `research/xconv_finetune/bundles/spleen_ct_segmentation/` (gitignored) |
 
-`pyxconv` is **NOT installed yet**. Before any run: `pip install -e ~/Codes/xconv_pv`
-(branch `ali`; add `--no-deps` to avoid touching torch). Editable so the live
-boundary-fixed tree is used. The fork's code does a plain `import pyxconv`.
+`pyxconv` is **installed editable** (`pip install -e ~/Codes/xconv_pv --no-deps`),
+pointing at the live boundary-fixed `ali` tree; `find_packages()` means
+**`radcompare` is importable too**. The fork does a plain `import pyxconv`. (Watch
+for a stale `pyxconv/__pycache__` in the fork dir shadowing it as an empty
+namespace package — delete any `research/xconv_finetune/pyxconv/` that reappears.)
 
 ---
 
@@ -103,7 +105,31 @@ Memory is **true NVML** (`gpu_mem.NvmlPeak`), not `torch.cuda.max_memory_allocat
 (Conv3d→Xconv3D + init-preservation guard) · `gpu_mem.py` (NVML peak poller) ·
 `memory.py` (torch-allocator sizing: `find_max_ps`, `maximize_ps`) · `engine.py`
 (train step + loop) · `run.py` (driver) · `calibrate.py` (max r ≤ baseline NVML) ·
-`sweep_batch.py` (baseline-vs-XConv NVML vs batch — finds the crossover).
+`sweep_batch.py` (baseline-vs-XConv NVML vs batch — finds the crossover) ·
+`age_memory.py` (AGE + peak-memory vs r — the rad-vs-xconv figures).
+
+### AGE + peak-memory figures (rad-vs-xconv methodology)
+`age_memory.py` produces the two canonical figures, **reusing `radcompare`
+verbatim** so numbers match the paper:
+- **AGE** (paper Eq. 9, `radcompare.age.average_gradient_error` /
+  `exact_full_gradient`): exact full-dataset gradient vs minibatch gradient on the
+  conv weights. Exact model's AGE = sampling floor; XConv decays toward it as `r`
+  grows (unbiased after the `ali` boundary fix — no plateau).
+- **Peak memory** (`radcompare.memory.peak_memory_mib`): **`torch_peak` via the
+  repo `MemoryTracker`, 2-iteration warm-up** (i=0 warms cuDNN, i=1 measured).
+- **Their `max_batch_for_budget`** (binary search for the largest batch fitting a
+  fixed memory budget) is the elegant framing: XConv's lower memory buys a larger
+  batch → lower AGE. (Their UNet sweep is `run_unet_age_vs_imgdim` over *image
+  dimension*; ours sweeps `r` at native 96³.)
+- Run: `python age_memory.py --rs 2,4,...,256 --batch 8 --subset 64 --n_runs 3`.
+  CPU-validated end-to-end with `--synthetic --skip_memory` (AGE decays with r).
+
+**Metric note / inconsistency to reconcile:** their canonical peak metric is
+**`torch_peak`** (via `MemoryTracker`, 2-iter) — what `age_memory.py` uses. But
+`run.py`/`calibrate.py`/`sweep_batch.py` use **NVML absolute** (`gpu_mem.NvmlPeak`).
+Both are defensible (NVML includes context+cuDNN workspace; torch_peak is the
+paper's reported number), but they are **different numbers** — pick one story or
+report both. The `ali` `MemoryTracker` exposes both (`torch_peak`, `nvidia_used`).
 
 ---
 
@@ -147,13 +173,19 @@ Memory is **true NVML** (`gpu_mem.NvmlPeak`), not `torch.cuda.max_memory_allocat
 
 ## 5. Open items / next steps
 
-1. **`pip install -e ~/Codes/xconv_pv` (branch `ali`)** before any run — pending.
-2. **Two-agent Gate-1 review of the PIVOTED (bundle) code** — the review was done
-   on the earlier SegResNet/self-pretrain version, which was then deleted. The
-   current bundle-based code has **not** been re-reviewed. Per the contract, do
-   this before promoting results.
-3. **Run the two comparisons** (baseline + xconv at batch 64) once GPU is free and
-   reviewed. Confirm XConv `nvml_peak_gb` ≤ baseline.
+1. **Editable install — DONE** (`pip install -e ~/Codes/xconv_pv --no-deps`;
+   verified fixed `ali` tree + `radcompare` importable). CPU prep done:
+   `age_memory.py` written and CPU-smoke-validated (`--synthetic --skip_memory`).
+2. **Two-agent Gate-1 review of the PIVOTED (bundle) code + `age_memory.py`** — the
+   review was done on the earlier SegResNet/self-pretrain version, which was then
+   deleted. The current bundle-based code has **not** been re-reviewed. Per the
+   contract, do this before promoting results.
+3. **Run, once GPU is free + reviewed:** (a) the two finetuning comparisons
+   (`run.py` baseline + xconv at batch 64) — confirm XConv ≤ baseline; (b) the
+   AGE + peak-memory figures (`age_memory.py`, full `r` sweep on GPU).
+3b. **Reconcile the memory metric** (see §3): `age_memory.py` uses `torch_peak`
+   (paper protocol); `run.py`/`calibrate.py` use NVML. Decide on one (or report
+   both) before the writeup.
 4. **`run.py`'s XConv auto-sizing uses torch peak + 15 GB card budget**
    (`maximize_ps`), NOT the NVML ≤baseline constraint. The README's procedure
    sidesteps this by using `calibrate.py` + explicit `--ps`. Consider rewiring
