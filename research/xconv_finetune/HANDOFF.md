@@ -10,7 +10,8 @@ and the open items.
 
 We finetune the **pretrained MONAI `spleen_ct_segmentation` UNet** twice — once
 with **regular Conv3d** (baseline, repo recipe) and once with **XConv** (probed
-low-memory weight gradient) — and compare **true GPU peak memory (NVML)**. The
+low-memory weight gradient) — and compare **peak GPU memory** (the rad-vs-xconv
+metric `radcompare.peak_memory_mib` = `torch_peak`, 2-iter warm-up). The
 point of XConv is to *not use more memory than the baseline* while training the
 conv layers. Code is in this directory; it is committed on branch
 `xconv-finetune` and pushed to the user's fork **`alisiahkoohi/MONAI`**
@@ -93,19 +94,20 @@ lr=0.002**, **StepLR(5000,0.1)**, **DiceCELoss**, GPU batch = 4 crops × loader_
 
 **The two comparisons (see README for exact commands):**
 1. `python run.py --method baseline --batch 64 --max_steps 60` → records
-   `nvml_peak_gb` (the ceiling).
-2. `python calibrate.py --batch 64 --rs 128,256,384,512` → largest `r` with NVML
-   peak ≤ baseline; then `python run.py --method xconv --batch 64 --ps <R>
+   `peak_mib` (the ceiling).
+2. `python calibrate.py --batch 64 --rs 128,256,384,512` → largest `r` with peak
+   ≤ baseline; then `python run.py --method xconv --batch 64 --ps <R>
    --max_steps 60`.
 
-Memory is **true NVML** (`gpu_mem.NvmlPeak`), not `torch.cuda.max_memory_allocated`.
+Memory is the **single canonical metric everywhere**: `radcompare.peak_memory_mib`
+(`torch_peak` from the repo `MemoryTracker`, 2-iteration warm-up, SGD lr=0).
 
 ### File map
 `bundle.py` (load pretrained UNet/loss/lr/scheduler/loader) · `xconv_ops.py`
-(Conv3d→Xconv3D + init-preservation guard) · `gpu_mem.py` (NVML peak poller) ·
-`memory.py` (torch-allocator sizing: `find_max_ps`, `maximize_ps`) · `engine.py`
-(train step + loop) · `run.py` (driver) · `calibrate.py` (max r ≤ baseline NVML) ·
-`sweep_batch.py` (baseline-vs-XConv NVML vs batch — finds the crossover) ·
+(Conv3d→Xconv3D + init-preservation guard) · `memory.py` (sizing via
+`peak_memory_mib`: `find_max_ps`, `maximize_ps`) · `engine.py` (train step + loop) ·
+`run.py` (driver, reports `peak_mib`) · `calibrate.py` (max r whose peak ≤ baseline) ·
+`sweep_batch.py` (baseline-vs-XConv peak vs batch — finds the crossover) ·
 `age_memory.py` (AGE + peak-memory vs r — the rad-vs-xconv figures).
 
 ### AGE + peak-memory figures (rad-vs-xconv methodology)
@@ -124,22 +126,23 @@ verbatim** so numbers match the paper:
 - Run: `python age_memory.py --rs 2,4,...,256 --batch 8 --subset 64 --n_runs 3`.
   CPU-validated end-to-end with `--synthetic --skip_memory` (AGE decays with r).
 
-**Metric note / inconsistency to reconcile:** their canonical peak metric is
-**`torch_peak`** (via `MemoryTracker`, 2-iter) — what `age_memory.py` uses. But
-`run.py`/`calibrate.py`/`sweep_batch.py` use **NVML absolute** (`gpu_mem.NvmlPeak`).
-Both are defensible (NVML includes context+cuDNN workspace; torch_peak is the
-paper's reported number), but they are **different numbers** — pick one story or
-report both. The `ali` `MemoryTracker` exposes both (`torch_peak`, `nvidia_used`).
+**Metric: unified (was an inconsistency, now fixed).** Every script measures peak
+via `radcompare.peak_memory_mib` (`torch_peak`, 2-iter, SGD lr=0) — the paper's
+reported metric. The earlier NVML poller (`gpu_mem.py`) was removed. Note this
+metric excludes the real optimizer's state (Novograd buffers) by design (matches
+the paper); the live finetune holds a bit more, but the *reported* comparison is
+the canonical number. If you ever want the device-level figure too, the `ali`
+`MemoryTracker` also exposes `nvidia_used`.
 
 ---
 
 ## 4. Critical findings (the journey — do not relearn these the hard way)
 
-1. **Measure memory with NVML, not the torch allocator.**
-   `torch.cuda.max_memory_allocated` misses the **cuDNN conv-workspace** and CUDA
-   context — exactly the region XConv changes. Use `gpu_mem.NvmlPeak` (polls
-   `nvmlDeviceGetMemoryInfo().used`). The user's tracker is
-   `~/Codes/xconv_pv/pyxconv/nvidia_mem_tracker.py`.
+1. **Use the rad-vs-xconv canonical peak metric — `radcompare.peak_memory_mib`.**
+   It is `torch_peak` from the repo `MemoryTracker` with a 2-iteration warm-up and
+   SGD lr=0 — the number the paper reports. (NVML/`nvidia_used` is also exposed by
+   the tracker and includes context+cuDNN workspace, but `torch_peak` is the
+   methodology to match; an earlier NVML poller was removed for consistency.)
 2. **cuDNN autotuning is a transient spike.** Cold first step (benchmark=True)
    spikes ~2 GB then settles. Always **warm up, then measure** for fair
    baseline-vs-XConv comparison (calibrate/sweep do this).
@@ -183,10 +186,11 @@ report both. The `ali` `MemoryTracker` exposes both (`torch_peak`, `nvidia_used`
 3. **Run, once GPU is free + reviewed:** (a) the two finetuning comparisons
    (`run.py` baseline + xconv at batch 64) — confirm XConv ≤ baseline; (b) the
    AGE + peak-memory figures (`age_memory.py`, full `r` sweep on GPU).
-3b. **Reconcile the memory metric** (see §3): `age_memory.py` uses `torch_peak`
-   (paper protocol); `run.py`/`calibrate.py` use NVML. Decide on one (or report
-   both) before the writeup.
-4. **`run.py`'s XConv auto-sizing uses torch peak + 15 GB card budget**
+3b. **Memory metric — DONE/unified:** every script now uses
+   `radcompare.peak_memory_mib`; the NVML poller was removed. (Open sub-point: the
+   metric excludes the live Novograd optimizer state by design — fine for the paper
+   comparison, but note it if you report absolute training footprint.)
+4. **`run.py`'s XConv auto-sizing uses `peak_memory_mib` + 15 GB card budget**
    (`maximize_ps`), NOT the NVML ≤baseline constraint. The README's procedure
    sidesteps this by using `calibrate.py` + explicit `--ps`. Consider rewiring
    `run.py` to size against the baseline's NVML peak directly.

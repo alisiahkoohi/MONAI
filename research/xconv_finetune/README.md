@@ -1,7 +1,7 @@
 # XConv finetuning of the MONAI spleen UNet — memory comparison
 
 Finetune the **pretrained** `spleen_ct_segmentation` MONAI bundle **with and
-without XConv**, and compare **true GPU peak memory**. No pretraining (the init is
+without XConv**, and compare **peak GPU memory**. No pretraining (the init is
 the bundle's `models/model.pt`) and no custom pipeline — the UNet, `DiceCELoss`,
 `Novograd`, `StepLR`, and data all come from the bundle's `configs/train.json`.
 XConv only swaps the convolutions for a probed, low-memory weight gradient.
@@ -25,25 +25,28 @@ CUDA, MONAI 1.5.2, `pynvml`.
 
 ## The two comparisons (exact commands)
 
-Run from this directory. Memory is the **true NVML** device peak (CUDA context +
-reserved pool + cuDNN workspace), not `torch.cuda.max_memory_allocated`.
+Run from this directory. Peak memory is the **rad-vs-xconv canonical metric**,
+`radcompare.memory.peak_memory_mib` — `torch_peak` from the repo `MemoryTracker`
+with a **2-iteration warm-up** (i=0 warms cuDNN, i=1 measured; SGD lr=0 so optimizer
+state is not counted). The **same** function is used in every script here, so all
+memory numbers are comparable.
 
 ```bash
 # 1) BASELINE — finetune the pretrained UNet with regular Conv3d, repo recipe
-#    (Novograd lr=0.002, StepLR(5000,0.1), DiceCELoss). Records the NVML peak = ceiling.
+#    (Novograd lr=0.002, StepLR(5000,0.1), DiceCELoss). Records the peak = ceiling.
 python run.py --method baseline --batch 64 --max_steps 60
-#    -> results/baseline_unet_spleen_b64.json   (field: nvml_peak_gb)
+#    -> results/baseline_unet_spleen_b64.json   (field: peak_mib)
 
 # 2) XCONV — same batch, probed convs. Pick the largest probing count r whose
-#    NVML peak stays <= the baseline's, then finetune at that r.
-python calibrate.py --batch 64 --rs 128,256,384,512        # -> largest r with NVML <= baseline
+#    peak stays <= the baseline's, then finetune at that r.
+python calibrate.py --batch 64 --rs 128,256,384,512        # -> largest r with peak <= baseline
 python run.py --method xconv --batch 64 --ps <R> --max_steps 60
 #    -> results/xconv_unet_spleen_b64_r<R>_independent_conv.json
 ```
 
-Both JSONs carry `nvml_peak_gb`, the conv-update proof, and (for XConv)
+Both JSONs carry `peak_mib`, the conv-update proof, and (for XConv)
 `convert_preserved_max_delta` (must be 0 — conversion preserves the pretrained
-init). Compare the two `nvml_peak_gb`: **XConv must be ≤ baseline.**
+init). Compare the two `peak_mib`: **XConv must be ≤ baseline.**
 
 ### Choosing the batch
 
@@ -52,7 +55,7 @@ not grow with batch) while the baseline grows ~linearly, so XConv only wins at
 **larger batch**. `sweep_batch.py` locates the crossover:
 
 ```bash
-python sweep_batch.py --r 256 --batches 8,16,32,64,96    # baseline vs xconv NVML peak per batch
+python sweep_batch.py --r 256 --batches 8,16,32,64,96    # baseline vs xconv peak per batch
 ```
 On this UNet (patch 96, 16 GB card) the crossover is ~batch 64; both OOM by 96
 (the UNet's skip connections pin the high-res activations, which XConv cannot
@@ -85,12 +88,11 @@ python age_memory.py --rs 2,4,8,16,32,64,128,256 --batch 8 --subset 64 --n_runs 
 |---|---|
 | `bundle.py` | load the bundle's pretrained UNet, loss, lr, scheduler, data loader |
 | `xconv_ops.py` | swap Conv3d→Xconv3D, conv introspection, init-preservation guard |
-| `gpu_mem.py` | true GPU peak via NVML polling (`NvmlPeak`) |
-| `memory.py` | torch-allocator sizing helpers (`find_max_ps`, `maximize_ps`) |
+| `memory.py` | sizing via `radcompare.peak_memory_mib` (`find_max_ps`, `maximize_ps`) |
 | `engine.py` | train step + finetune loop (pure) |
-| `run.py` | CLI: finetune a method, record NVML peak + conv-update + preservation |
-| `calibrate.py` | largest `r` whose NVML peak ≤ baseline (the operating-point picker) |
-| `sweep_batch.py` | baseline-vs-XConv NVML peak across batch (finds the crossover) |
+| `run.py` | CLI: finetune a method, record `peak_mib` + conv-update + preservation |
+| `calibrate.py` | largest `r` whose `peak_memory_mib` ≤ baseline (operating-point picker) |
+| `sweep_batch.py` | baseline-vs-XConv `peak_memory_mib` across batch (finds the crossover) |
 | `age_memory.py` | AGE + peak-memory vs `r` (reuses `radcompare`; paper figures) |
 
 ## Notes / caveats

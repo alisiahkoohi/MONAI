@@ -16,10 +16,10 @@ import os
 import numpy as np
 import torch
 from monai.optimizers import Novograd
+from radcompare import peak_memory_mib
 
 import bundle as B
 import engine
-import gpu_mem
 import memory as mem
 import xconv_ops as xc
 
@@ -66,11 +66,7 @@ def main():
     loss_fn = B.loss_fn(a.dataset_dir)
     lr = B.optimizer_lr(a.dataset_dir)
 
-    def synth_step(model, gpu_batch):
-        opt = Novograd(model.parameters(), lr=lr)
-        img, lbl = B.synthetic_batch(gpu_batch, device)
-        engine.train_step(model, img, lbl, loss_fn, opt)
-
+    make_inputs = lambda b: B.synthetic_batch(b, device)   # for peak-memory sizing
     xbare = lambda ps: xc.apply_xconv(B.bare_net(a.dataset_dir, device), ps, a.xmode, a.xconv_target)
 
     # --- 1) baseline follows the REPO hyperparams: its batch is the bundle's own
@@ -87,8 +83,9 @@ def main():
     else:
         if a.size_strategy == "max_ps" and a.ps <= 0:
             print(f"[sizing] maximize r (drop batch as needed, ceiling B0={b0})")
-            a.ps, a.batch, m = mem.maximize_ps(xbare, synth_step, device, a.mem_budget_gb,
-                                               max_batch=b0, batch_ladder=PS_BATCH_LADDER,
+            a.ps, a.batch, m = mem.maximize_ps(xbare, make_inputs, loss_fn, device,
+                                               a.mem_budget_gb, max_batch=b0,
+                                               batch_ladder=PS_BATCH_LADDER,
                                                min_batch=B.NUM_SAMPLES)
             note = "" if a.batch == b0 else f" (batch {b0}->{a.batch} for larger r)"
             print(f"[sizing] r={a.ps} at batch={a.batch} (peak {m:.2f} GB){note}")
@@ -96,7 +93,8 @@ def main():
             if a.batch <= 0:
                 a.batch = b0
             if a.ps <= 0:
-                a.ps, m = mem.find_max_ps(xbare, synth_step, a.batch, device, a.mem_budget_gb)
+                a.ps, m = mem.find_max_ps(xbare, make_inputs, a.batch, loss_fn, device,
+                                          a.mem_budget_gb)
                 print(f"[sizing] r={a.ps} at fixed batch={a.batch} (peak {m:.2f} GB)")
 
     # --- 3) build the finetuning model: load pretrained THEN convert (preserve init) ---
@@ -114,14 +112,19 @@ def main():
     scheduler = B.make_scheduler(optimizer, a.dataset_dir)  # bundle StepLR
     torch.backends.cudnn.benchmark = True
 
-    # --- 4) finetune, proving the convs actually move ---
     init = xc.snapshot_conv_weights(model)
+
+    # --- 4) canonical peak memory: radcompare.peak_memory_mib (torch_peak from the
+    #    repo MemoryTracker, 2-iteration warm-up, SGD lr=0). Same metric everywhere.
+    xp, yp = make_inputs(a.batch)
+    peak_mib = peak_memory_mib(model, xp, yp, loss_fn=loss_fn)
+    print(f"[memory] {a.method} peak {peak_mib:.0f} MiB (torch_peak, 2-iter, batch={a.batch})")
+
+    # --- 5) finetune, proving the convs actually move (memory already measured) ---
     print(f"[finetune] {a.method} {a.max_steps} steps (batch={a.batch}"
           + (f", r={a.ps}" if a.method == "xconv" else "") + ")")
-    with gpu_mem.NvmlPeak() as nv:                          # true GPU peak (NVML)
-        hist = engine.finetune(model, loader, loss_fn, optimizer, a.max_steps, device,
-                               mem.track_peak(device), scheduler=scheduler)
-    nvml_peak_gb = nv.peak_gb
+    hist = engine.finetune(model, loader, loss_fn, optimizer, a.max_steps, device,
+                           scheduler=scheduler)
     deltas = list(xc.conv_update_deltas(model, init).values())
     gate = 1e-4  # bundle Novograd has no weight decay, so any motion is gradient-driven
     conv_update = {"min": min(deltas), "max": max(deltas), "mean": sum(deltas) / len(deltas),
@@ -142,14 +145,15 @@ def main():
         "xmode": a.xmode, "xconv_target": a.xconv_target,
         "convert_preserved_max_delta": preserved,
         "conv_report": xc.conv_report(model), "conv_update": conv_update,
-        "peak_gb": hist["peak_gb"], "nvml_peak_gb": nvml_peak_gb, "n_steps": len(losses),
+        "peak_mib": peak_mib, "peak_metric": "radcompare.peak_memory_mib (torch_peak, 2-iter)",
+        "n_steps": len(losses),
         "first_loss": losses[0] if losses else None,
         "final_loss": losses[-1] if losses else None,
         "min_loss": min(losses) if losses else None,
     }
     out = os.path.join(a.out_dir, run_name(a) + ".json")
     json.dump(result, open(out, "w"), indent=2)
-    print(f"[done] {a.method}: NVML peak {nvml_peak_gb:.2f} GB (torch {hist['peak_gb']:.2f})"
+    print(f"[done] {a.method}: peak {peak_mib:.0f} MiB"
           + (f", r={a.ps} at batch {a.batch}" if a.method == "xconv" else f", batch {a.batch}")
           + f" -> {out}")
 
