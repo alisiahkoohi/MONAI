@@ -97,6 +97,32 @@ def train_loader(dataset_dir: str, gpu_batch: int, num_workers: int):
     return parser.get_parsed_content("train#dataloader")
 
 
+def val_loader(dataset_dir: str, n_volumes: int, num_workers: int):
+    """DataLoader over ``n_volumes`` held-out FULL spleen volumes (no random crop),
+    for sliding-window Dice eval. Uses the bundle's validation preprocessing and
+    holds out the last volumes (the bundle trains on the rest)."""
+    import glob
+
+    from torch.utils.data import DataLoader
+    from monai.data import Dataset, list_data_collate
+    from monai.transforms import (Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+                                  Spacingd, ScaleIntensityRanged, CropForegroundd, EnsureTyped)
+    dd = os.path.abspath(dataset_dir)
+    imgs = sorted(glob.glob(os.path.join(dd, "imagesTr", "*.nii.gz")))
+    lbls = sorted(glob.glob(os.path.join(dd, "labelsTr", "*.nii.gz")))
+    pairs = [{"image": i, "label": l} for i, l in zip(imgs, lbls)][-n_volumes:]
+    keys = ("image", "label")
+    tf = Compose([
+        LoadImaged(keys=keys), EnsureChannelFirstd(keys=keys),
+        Orientationd(keys=keys, axcodes="RAS"),
+        Spacingd(keys=keys, pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+        ScaleIntensityRanged(keys="image", a_min=-57.0, a_max=164.0, b_min=0.0, b_max=1.0, clip=True),
+        CropForegroundd(keys=keys, source_key="image"), EnsureTyped(keys=keys),
+    ])
+    return DataLoader(Dataset(pairs, transform=tf), batch_size=1, num_workers=num_workers,
+                      collate_fn=list_data_collate)
+
+
 def synthetic_batch(gpu_batch: int, device: torch.device):
     """Image/label tensors matching a real step, for the memory-sizing probes."""
     img = torch.randn(gpu_batch, IN_CHANNELS, PATCH, PATCH, PATCH, device=device)

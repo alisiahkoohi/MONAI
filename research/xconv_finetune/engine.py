@@ -46,3 +46,24 @@ def finetune(model: nn.Module, loader, loss_fn: nn.Module,
             if step >= max_steps:
                 break
     return {"losses": losses}
+
+
+@torch.no_grad()
+def evaluate_dice(model, val_loader, patch, device) -> float:
+    """Mean foreground Dice via sliding-window inference — the bundle's metric."""
+    from monai.inferers import sliding_window_inference
+    from monai.metrics import DiceMetric
+    from monai.transforms import AsDiscrete
+    from monai.data import decollate_batch
+
+    model.eval()
+    metric = DiceMetric(include_background=False, reduction="mean")
+    post_pred = AsDiscrete(argmax=True, to_onehot=2)
+    post_lbl = AsDiscrete(to_onehot=2)
+    for batch in val_loader:
+        img = batch["image"].to(device)
+        lbl = batch["label"].to(device)
+        logits = sliding_window_inference(img, (patch, patch, patch), 4, model, overlap=0.25)
+        metric(y_pred=[post_pred(p) for p in decollate_batch(logits)],
+               y=[post_lbl(g) for g in decollate_batch(lbl)])
+    return float(metric.aggregate().item())

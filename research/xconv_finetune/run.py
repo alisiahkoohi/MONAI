@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument("--xmode", default="independent")
     p.add_argument("--xconv_target", choices=["conv", "all"], default="conv")
     p.add_argument("--max_steps", type=int, default=60)
+    p.add_argument("--lr", type=float, default=0.0)        # 0 -> bundle lr (0.002); else override
+    p.add_argument("--val_volumes", type=int, default=5)   # held-out volumes for Dice
     p.add_argument("--mem_budget_gb", type=float, default=15.0)
     p.add_argument("--dataset_dir", default=os.path.join(_HERE, "data", "Task09_Spleen"))
     p.add_argument("--num_workers", type=int, default=4)
@@ -64,7 +66,7 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
 
     loss_fn = B.loss_fn(a.dataset_dir)
-    lr = B.optimizer_lr(a.dataset_dir)
+    lr = a.lr if a.lr > 0 else B.optimizer_lr(a.dataset_dir)
 
     make_inputs = lambda b: B.synthetic_batch(b, device)   # for peak-memory sizing
     xbare = lambda ps: xc.apply_xconv(B.bare_net(a.dataset_dir, device), ps, a.xmode, a.xconv_target)
@@ -132,6 +134,15 @@ def main():
     print(f"[verify] convs updated: {conv_update['convs_updated']} "
           f"(min {conv_update['min']:.2e}, mean {conv_update['mean']:.2e})")
 
+    # --- 6) segmentation accuracy: mean foreground Dice on held-out volumes ---
+    val_dice = None
+    try:
+        vl = B.val_loader(a.dataset_dir, a.val_volumes, a.num_workers)
+        val_dice = engine.evaluate_dice(model, vl, B.PATCH, device)
+        print(f"[eval] mean foreground Dice on {a.val_volumes} val volumes: {val_dice:.4f}")
+    except RuntimeError as err:
+        print(f"[eval] Dice skipped ({'OOM' if 'out of memory' in str(err).lower() else 'error'}): {err}")
+
     losses = hist["losses"]
     np.save(os.path.join(a.out_dir, run_name(a) + "_losses.npy"),
             np.asarray(losses, dtype=np.float32))
@@ -146,6 +157,7 @@ def main():
         "convert_preserved_max_delta": preserved,
         "conv_report": xc.conv_report(model), "conv_update": conv_update,
         "peak_mib": peak_mib, "peak_metric": "radcompare.peak_memory_mib (torch_peak, 2-iter)",
+        "val_dice": val_dice, "val_volumes": a.val_volumes,
         "n_steps": len(losses),
         "first_loss": losses[0] if losses else None,
         "final_loss": losses[-1] if losses else None,
@@ -154,6 +166,7 @@ def main():
     out = os.path.join(a.out_dir, run_name(a) + ".json")
     json.dump(result, open(out, "w"), indent=2)
     print(f"[done] {a.method}: peak {peak_mib:.0f} MiB"
+          + (f", Dice {val_dice:.4f}" if val_dice is not None else "")
           + (f", r={a.ps} at batch {a.batch}" if a.method == "xconv" else f", batch {a.batch}")
           + f" -> {out}")
 

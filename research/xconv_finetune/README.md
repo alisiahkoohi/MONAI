@@ -96,6 +96,11 @@ python age_memory.py --rs 2,4,8,16,32,64,128,256 --batch 8 --subset 64 --n_runs 
 | `calibrate.py` | largest `r` whose `peak_memory_mib` ≤ baseline (operating-point picker) |
 | `sweep_batch.py` | baseline-vs-XConv `peak_memory_mib` across batch (finds the crossover) |
 | `age_memory.py` | AGE + peak-memory vs `r` (reuses `radcompare`; paper figures) |
+| `visualize.py` | paper figures: CT/GT/prediction overlay + 3D grid (MONAI `blend_images`/`matshow3d`) + memory/Dice comparison |
+| `auto_run.py` | size (under `peak_memory_mib`) then run baseline + XConv back to back |
+
+`run.py` reports **Dice** (`--val_volumes`, MONAI `SlidingWindowInferer` + `MeanDice`)
+and takes an optional `--lr` override. Figures land in `results/figures/`.
 
 ## Notes / caveats
 
