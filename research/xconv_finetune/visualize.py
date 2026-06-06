@@ -89,24 +89,34 @@ def segmentation_figures(dataset_dir, out_dir, device):
 
 
 def comparison_figure(res_dir, out_dir):
-    def latest(pat):
-        fs = sorted(glob.glob(os.path.join(res_dir, pat)), key=os.path.getmtime)
-        return json.load(open(fs[-1])) if fs else None
-    b = latest("baseline_unet_spleen_b*.json")
-    x = latest("xconv_unet_spleen_b*.json")
-    if not b or not x:
+    bfs = glob.glob(os.path.join(res_dir, "baseline_unet_spleen_b*.json"))
+    xfs = glob.glob(os.path.join(res_dir, "xconv_unet_spleen_b*.json"))
+    if not bfs or not xfs:
         print("comparison: missing result JSONs", flush=True)
         return
-    fig, ax = plt.subplots(1, 2, figsize=(7.2, 3.3))
-    ax[0].bar(["exact", "XConv"], [b["peak_mib"], x["peak_mib"]], color=[EXACT, XCONV], width=0.6)
+    b = json.load(open(sorted(bfs, key=os.path.getmtime)[-1]))
+    bb = b.get("resolved_batch")
+    xs = [d for d in (json.load(open(f)) for f in xfs)
+          if "peak_mib" in d and d.get("resolved_batch") == bb]
+    xs.sort(key=lambda d: d.get("resolved_ps") or 0)
+    labels = ["exact"] + [f"XConv\nr={x['resolved_ps']}, {x['n_steps']} st." for x in xs]
+    mems = [b["peak_mib"]] + [x["peak_mib"] for x in xs]
+    dices = [b.get("val_dice") or 0] + [x.get("val_dice") or 0 for x in xs]
+    # exact blue; XConv reds, darker = smaller r (more saving)
+    reds = ["#fb6a4a", "#de2d26", "#a50f15", "#67000d"]
+    colors = [EXACT] + [reds[min(i, len(reds) - 1)] for i in range(len(xs))]
+
+    fig, ax = plt.subplots(1, 2, figsize=(8.5, 3.6))
+    ax[0].bar(labels, mems, color=colors, width=0.7)
+    ax[0].axhline(b["peak_mib"], ls="--", lw=0.8, color=EXACT)
     ax[0].set_ylabel("peak memory (MiB)"); ax[0].set_title("memory")
-    dice = [b.get("val_dice") or 0, x.get("val_dice") or 0]
-    ax[1].bar(["exact", "XConv"], dice, color=[EXACT, XCONV], width=0.6)
+    ax[1].bar(labels, dices, color=colors, width=0.7)
+    ax[1].axhline(b.get("val_dice") or 0, ls="--", lw=0.8, color=EXACT)
     ax[1].set_ylabel("foreground Dice"); ax[1].set_ylim(0, 1); ax[1].set_title("accuracy")
     for a in ax:
         a.spines["top"].set_visible(False); a.spines["right"].set_visible(False)
-    fig.suptitle(f"spleen UNet finetune — batch {b.get('resolved_batch')}, "
-                 f"XConv r={x.get('resolved_ps')}", y=1.02, fontsize=11)
+        a.tick_params(axis="x", labelsize=8)
+    fig.suptitle(f"spleen UNet finetune at batch {b.get('resolved_batch')}", y=1.02, fontsize=11)
     _save(fig, os.path.join(out_dir, "comparison"))
 
 
