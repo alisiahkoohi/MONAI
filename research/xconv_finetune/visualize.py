@@ -166,8 +166,11 @@ def loss_figure(res_dir, out_dir):
         ax.plot(bv[:, 0], bv[:, 1], "--o", ms=3, color=EXACT, lw=1.2, label="conv — val")
     if xv is not None and len(xv):
         ax.plot(xv[:, 0], xv[:, 1], "--o", ms=3, color=XCONV, lw=1.2, label="XConv r=4 — val")
+    import re
+    m = re.search(r"_b(\d+)_", os.path.basename(bt_f))
+    bsz = m.group(1) if m else "?"
     ax.set_xlabel("training step"); ax.set_ylabel("DiceCE loss")
-    ax.set_title("spleen UNet finetune — loss (batch 64, lr 2e-4, 600 steps)")
+    ax.set_title(f"spleen UNet finetune — loss (batch {bsz}, lr 2e-4, {len(bt)} steps)")
     ax.legend(frameon=False, fontsize=9)
     ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
     _save(fig, os.path.join(out_dir, "loss_curves"))
@@ -243,6 +246,60 @@ def segmentation_comparison(dataset_dir, out_dir, device, n_volumes=3, n_slices=
         _save(fig, os.path.join(seg_dir, f"volume_{vi + 1}"))
 
 
+def _save_tile(rgb, path):
+    """Save a borderless, full-bleed image tile (no axes/title/padding) as png+pdf,
+    so tiles for the same slice are pixel-identical and assemble cleanly side by side."""
+    h, w = rgb.shape[:2]
+    fig = plt.figure(figsize=(w / 100, h / 100), dpi=100)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_axis_off()
+    ax.imshow(rgb, origin="lower")
+    fig.savefig(path + ".png", dpi=200)
+    fig.savefig(path + ".pdf")
+    plt.close(fig)
+
+
+def segmentation_individual(dataset_dir, out_dir, device, n_volumes=3, n_slices=4):
+    """Fully individual per-slice tiles: for each held-out volume and axial slice, one
+    standalone borderless image per column — raw CT, ground truth, conv (exact), and
+    XConv r=4 — named so the set for a slice sorts together (assemble side by side)."""
+    ck = os.path.join(_HERE, "results", "checkpoints")
+    pick = lambda stem: (sorted(glob.glob(os.path.join(ck, stem)), key=os.path.getmtime) or [None])[-1]
+    conv_ckpt = pick("baseline_unet_spleen_b*.pth")
+    xconv_ckpt = pick("xconv_unet_spleen_b*_r4_independent_conv.pth")
+    if not conv_ckpt or not xconv_ckpt:
+        print("seg_individual: missing checkpoints (run finetune with --save_ckpt 1)", flush=True)
+        return
+    out = os.path.join(out_dir, "segmentation", "slices")
+    os.makedirs(out, exist_ok=True)
+    m_conv = _load_for_inference(dataset_dir, conv_ckpt, device)
+    m_xconv = _load_for_inference(dataset_dir, xconv_ckpt, device)
+    n = 0
+    for vi, batch in enumerate(B.val_loader(dataset_dir, n_volumes, 0)):
+        img = batch["image"].to(device)
+        lbl = batch["label"][0].cpu().float()
+        with torch.no_grad():
+            lc = sliding_window_inference(img, (96, 96, 96), 4, m_conv, overlap=0.25)
+            lx = sliding_window_inference(img, (96, 96, 96), 4, m_xconv, overlap=0.25)
+        pc = torch.argmax(lc, 1, keepdim=True)[0].cpu().float()
+        px = torch.argmax(lx, 1, keepdim=True)[0].cpu().float()
+        ct = img[0].cpu().float()
+        sums = lbl[0].sum(dim=(0, 1))
+        zsel = sorted(int(z) for z in torch.argsort(sums, descending=True)[:n_slices]
+                      if sums[int(z)] > 0)
+        for z in zsel:
+            ct_s = ct[:, :, :, z]
+            stem = os.path.join(out, f"vol{vi + 1}_z{z:03d}")
+            # raw CT (grayscale, no overlay)
+            ct_rgb = np.repeat(np.clip(ct_s[0].numpy().T, 0, 1)[..., None], 3, axis=2)
+            _save_tile(ct_rgb, stem + "_ct")
+            for kind, vol in (("gt", lbl), ("conv", pc), ("xconv", px)):
+                bimg = blend_images(ct_s, vol[:, :, :, z], alpha=0.5, cmap="hsv",
+                                    rescale_arrays=True)
+                _save_tile(np.transpose(_to_rgb(bimg), (1, 0, 2)), f"{stem}_{kind}")
+            n += 4
+    print(f"seg_individual: wrote {n} tiles (png+pdf) to {out}", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_dir", default=os.path.join(_HERE, "data", "Task09_Spleen"))
@@ -253,6 +310,8 @@ def main():
     p.add_argument("--loss_only", action="store_true")
     p.add_argument("--seg_compare", action="store_true",
                    help="per-slice GT|conv|XConv overlays from the two finetuned checkpoints")
+    p.add_argument("--seg_individual", action="store_true",
+                   help="fully individual borderless tiles (CT, GT, conv, XConv) per slice")
     a = p.parse_args()
     res = os.path.join(_HERE, "results")
     os.makedirs(a.out_dir, exist_ok=True)
@@ -263,6 +322,10 @@ def main():
     if a.seg_compare:
         dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
         segmentation_comparison(a.dataset_dir, a.out_dir, dev)
+        return
+    if a.seg_individual:
+        dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
+        segmentation_individual(a.dataset_dir, a.out_dir, dev)
         return
     if not a.compare_only:
         dev = torch.device(a.device if torch.cuda.is_available() else "cpu")

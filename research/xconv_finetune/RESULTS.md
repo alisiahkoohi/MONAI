@@ -113,14 +113,17 @@ and the finetuned checkpoints under `results/checkpoints/`).
 | `segmentation_3d.{pdf,png}` | axial-slice grid with predicted spleen overlay (MONAI `matshow3d`) | done |
 | `loss/loss_curves.{pdf,png}` | training (solid) **+ validation (dashed)** DiceCE loss vs step, conv=blue / XConv r=4=red; batch 8, 600 steps | **done** |
 | `segmentation/volume_{1,2,3}.{pdf,png}` | per-slice **GT │ conv (exact) │ XConv r=4** spleen overlays (4 axial slices/volume, MONAI `blend_images`); per-volume Dice in the title | **done** |
+| `segmentation/slices/vol{V}_z{Z}_{ct,gt,conv,xconv}.{png,pdf}` | **fully individual** borderless tiles — one image each for raw CT, GT, conv, XConv r=4, per slice (assemble side by side; see below) | **done** |
 
-Built by `visualize.py` (`--loss_only`, `--seg_compare`, `--compare_only`, `--seg_only`;
-uses MONAI's own viz). The loss + segmentation figures above were produced on **CPU at
-batch 8** (the GPU was contended) from the saved checkpoints. Regenerate any time:
+Built by `visualize.py` (`--loss_only`, `--seg_compare`, `--seg_individual`,
+`--compare_only`, `--seg_only`; uses MONAI's own viz). The loss + segmentation figures
+above were produced on **CPU at batch 8** (the GPU was contended) from the saved
+checkpoints. Regenerate any time:
 
 ```bash
-python visualize.py --loss_only       # -> results/figures/loss/loss_curves.{pdf,png}
-python visualize.py --seg_compare      # -> results/figures/segmentation/volume_*.{pdf,png}
+python visualize.py --loss_only        # -> results/figures/loss/loss_curves.{pdf,png}
+python visualize.py --seg_compare       # -> results/figures/segmentation/volume_*.{pdf,png}
+python visualize.py --seg_individual    # -> results/figures/segmentation/slices/vol*_z*_*.{png,pdf}
 ```
 
 To reproduce the batch-8 runs themselves (CPU; ~20 min conv, ~40 min XConv r=4):
@@ -128,6 +131,44 @@ To reproduce the batch-8 runs themselves (CPU; ~20 min conv, ~40 min XConv r=4):
 ```bash
 python run.py --method baseline --batch 8 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 3 --device cpu
 python run.py --method xconv    --batch 8 --ps 4 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 3 --device cpu
+```
+
+### Individual per-slice tiles — `results/figures/segmentation/slices/`
+
+Borderless, full-bleed tiles (no axes/titles/padding), **one image per column per slice**,
+so the four tiles for a slice are pixel-identical in size and assemble cleanly. Naming:
+
+```
+vol{V}_z{Z}_{kind}.{png,pdf}        kind ∈ {ct, gt, conv, xconv}
+#  V = held-out volume (1..3)
+#  Z = zero-padded axial-slice index (e.g. z087)
+```
+
+All four tiles for a slice share the prefix `vol{V}_z{Z}_`, so they group together. The
+intended **left-to-right order is `ct → gt → conv → xconv`** (note: this differs from the
+alphabetical sort `conv, ct, gt, xconv`). Drop the `ct` tile if you only want
+GT │ conv │ XConv. To place them next to each other:
+
+**ImageMagick** — build one composite row per slice (CT │ GT │ conv │ XConv):
+
+```bash
+cd results/figures/segmentation/slices
+for s in vol*_z*_ct.png; do b=${s%_ct.png}
+  montage "${b}_ct.png" "${b}_gt.png" "${b}_conv.png" "${b}_xconv.png" \
+    -tile 4x1 -geometry +2+2 "${b}_row.png"
+done
+```
+
+**LaTeX** — 4 vector columns (swap in any `vol{V}_z{Z}`):
+
+```latex
+\begin{figure}\centering
+  \foreach \k/\c in {ct/CT, gt/GT, conv/conv (exact), xconv/XConv r=4}{%
+    \begin{subfigure}{0.24\linewidth}\centering
+      \includegraphics[width=\linewidth]{slices/vol1_z087_\k.pdf}\caption*{\c}
+    \end{subfigure}\hfill}
+  \caption{Held-out volume 1, axial slice z=087.}
+\end{figure}
 ```
 
 ---
