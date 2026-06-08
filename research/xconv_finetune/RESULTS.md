@@ -81,6 +81,27 @@ batch 32 → 5928 MiB · 48 → 9142 · **64 → 12206** · 80 → baseline OOM.
 All runs preserve the pretrained init through conversion (delta 0) and verify the
 conv weights move during finetuning.
 
+### Loss curves & per-slice segmentation runs (batch 8, identical recipe, CPU)
+
+The GPU was contended when these figures were made (free memory swung 11.9 → 5.2 GB as
+other jobs grabbed ~10 GB), so the **training-dynamics + qualitative-segmentation** runs
+were done on **CPU at batch 8**. Conv-vs-XConv parity is batch-independent, so this does
+**not** affect the batch-64 peak-memory headline above. Both runs use the *identical*
+recipe (Novograd, lr 2e-4, StepLR(5000,0.1), DiceCELoss, 600 steps); only the conv
+weight gradient differs (exact vs probed r=4).
+
+| run (batch 8, 600 steps, lr 2e-4) | r | Dice (3 held-out vols) | final train loss | init preserved | convs trained |
+|---|---|---|---|---|---|
+| baseline (conv, exact) | — | **0.9639** | 0.0042 | — | yes (mean rel-L2 1.2e-2) |
+| **XConv (probed)** | **4** | **0.9649** (Δ +0.0010) | 0.0061 | max delta **0.0** | yes (mean rel-L2 1.1e-2) |
+
+Per-volume foreground Dice (annotated on each segmentation figure) — conv / XConv r=4:
+**0.965 / 0.966** (vol 1), **0.962 / 0.963** (vol 2), **0.965 / 0.966** (vol 3). XConv
+matches the exact conv to within **±0.001** on every volume, and the overlays are
+visually indistinguishable. Artifacts: `baseline_unet_spleen_b8.json`,
+`xconv_unet_spleen_b8_r4_independent_conv.json` (+ `_losses.npy`, `_val_losses.npy`,
+and the finetuned checkpoints under `results/checkpoints/`).
+
 ---
 
 ## Figures — directory guide (`results/figures/`, vector PDF + PNG @ 300 dpi)
@@ -90,21 +111,23 @@ conv weights move during finetuning.
 | `comparison.{pdf,png}` | peak memory + Dice bars: exact vs XConv r=4 (600 st) vs XConv r=512 (60 st) | done |
 | `segmentation_panel.{pdf,png}` | input CT │ GT overlay │ prediction overlay (MONAI `blend_images`), most-spleen slice | done |
 | `segmentation_3d.{pdf,png}` | axial-slice grid with predicted spleen overlay (MONAI `matshow3d`) | done |
-| `loss/loss_curves.{pdf,png}` | training loss vs step, conv=blue / XConv r=4=red (15-step smoothed); val-loss dashed when available | **train done; val pending** |
-| `segmentation/` | per-slice GT │ conv │ XConv prediction comparison, a few test volumes | **pending GPU** |
+| `loss/loss_curves.{pdf,png}` | training (solid) **+ validation (dashed)** DiceCE loss vs step, conv=blue / XConv r=4=red; batch 8, 600 steps | **done** |
+| `segmentation/volume_{1,2,3}.{pdf,png}` | per-slice **GT │ conv (exact) │ XConv r=4** spleen overlays (4 axial slices/volume, MONAI `blend_images`); per-volume Dice in the title | **done** |
 
-Built by `visualize.py` (`--loss_only`, `--compare_only`, `--seg_only`; uses MONAI's
-own viz). The training-loss plot is data-only (CPU).
-
-**Pending a free GPU** (code is in place — `run.py --val_every` + saved checkpoints
-under `results/checkpoints/`, and the per-model segmentation viz). A 600-step 3D-UNet
-re-run + sliding-window inference is impractical on CPU. To produce them:
+Built by `visualize.py` (`--loss_only`, `--seg_compare`, `--compare_only`, `--seg_only`;
+uses MONAI's own viz). The loss + segmentation figures above were produced on **CPU at
+batch 8** (the GPU was contended) from the saved checkpoints. Regenerate any time:
 
 ```bash
-python run.py --method baseline --batch 64 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 5
-python run.py --method xconv    --batch 64 --ps 4 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 5
-python visualize.py --loss_only          # adds the validation dashed lines
-# (conv-vs-xconv per-slice segmentation viz from the two saved checkpoints)
+python visualize.py --loss_only       # -> results/figures/loss/loss_curves.{pdf,png}
+python visualize.py --seg_compare      # -> results/figures/segmentation/volume_*.{pdf,png}
+```
+
+To reproduce the batch-8 runs themselves (CPU; ~20 min conv, ~40 min XConv r=4):
+
+```bash
+python run.py --method baseline --batch 8 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 3 --device cpu
+python run.py --method xconv    --batch 8 --ps 4 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 3 --device cpu
 ```
 
 ---
