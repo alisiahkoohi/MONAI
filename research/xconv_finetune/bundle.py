@@ -123,6 +123,37 @@ def val_loader(dataset_dir: str, n_volumes: int, num_workers: int):
                       collate_fn=list_data_collate)
 
 
+def fixed_val_patches(dataset_dir: str, n_patches: int, device: torch.device, seed: int = 0):
+    """A FIXED batch of ``n_patches`` 96^3 patches from a held-out volume, for the
+    validation-loss curve (same patches every eval). Returns (image, label) on device."""
+    import glob
+
+    from monai.data import Dataset
+    from monai.transforms import (Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+                                  Spacingd, ScaleIntensityRanged, CropForegroundd,
+                                  RandCropByPosNegLabeld, EnsureTyped)
+    torch.manual_seed(seed)
+    dd = os.path.abspath(dataset_dir)
+    imgs = sorted(glob.glob(os.path.join(dd, "imagesTr", "*.nii.gz")))
+    lbls = sorted(glob.glob(os.path.join(dd, "labelsTr", "*.nii.gz")))
+    held_out = [{"image": imgs[-1], "label": lbls[-1]}]
+    keys = ("image", "label")
+    tf = Compose([
+        LoadImaged(keys=keys), EnsureChannelFirstd(keys=keys),
+        Orientationd(keys=keys, axcodes="RAS"),
+        Spacingd(keys=keys, pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+        ScaleIntensityRanged(keys="image", a_min=-57.0, a_max=164.0, b_min=0.0, b_max=1.0, clip=True),
+        CropForegroundd(keys=keys, source_key="image"),
+        RandCropByPosNegLabeld(keys=keys, label_key="label", spatial_size=(PATCH, PATCH, PATCH),
+                               pos=1, neg=1, num_samples=n_patches, image_key="image"),
+        EnsureTyped(keys=keys),
+    ])
+    samples = Dataset(held_out, transform=tf)[0]   # list of n_patches dicts
+    img = torch.stack([s["image"] for s in samples]).to(device)
+    lbl = torch.stack([s["label"] for s in samples]).to(device)
+    return img, lbl
+
+
 def synthetic_batch(gpu_batch: int, device: torch.device):
     """Image/label tensors matching a real step, for the memory-sizing probes."""
     img = torch.randn(gpu_batch, IN_CHANNELS, PATCH, PATCH, PATCH, device=device)

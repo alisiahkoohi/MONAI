@@ -94,7 +94,13 @@ def comparison_figure(res_dir, out_dir):
     if not bfs or not xfs:
         print("comparison: missing result JSONs", flush=True)
         return
-    b = json.load(open(sorted(bfs, key=os.path.getmtime)[-1]))
+    # pin to the HEADLINE batch (the largest we ran = 64); smaller-batch runs that
+    # only exist for the loss/segmentation figures must not hijack this chart.
+    bcands = [d for d in (json.load(open(f)) for f in bfs) if "peak_mib" in d]
+    if not bcands:
+        print("comparison: no baseline JSON with peak_mib", flush=True)
+        return
+    b = max(bcands, key=lambda d: d.get("resolved_batch") or 0)
     bb = b.get("resolved_batch")
     xs = [d for d in (json.load(open(f)) for f in xfs)
           if "peak_mib" in d and d.get("resolved_batch") == bb]
@@ -120,6 +126,123 @@ def comparison_figure(res_dir, out_dir):
     _save(fig, os.path.join(out_dir, "comparison"))
 
 
+def _pick_loss_npy(res_dir, train_glob):
+    """Newest matching train-loss .npy, preferring a run that also recorded
+    validation loss, then the longest (the 600-step run). Returns (train, val) paths."""
+    fs = [f for f in glob.glob(os.path.join(res_dir, train_glob))
+          if not f.endswith("_val_losses.npy")]
+    if not fs:
+        return None, None
+    valf = lambda f: f[:-len("_losses.npy")] + "_val_losses.npy"
+    withval = [f for f in fs if os.path.exists(valf(f))]
+    train = max(withval or fs, key=lambda f: (len(np.load(f)), os.path.getmtime(f)))
+    vf = valf(train)
+    return train, (vf if os.path.exists(vf) else None)
+
+
+def loss_figure(res_dir, out_dir):
+    """Training (solid) and, if available, validation (dashed) loss vs step:
+    exact/conv = blue, XConv = red. Auto-picks the 600-step r=4 run vs the matching
+    baseline (preferring whichever runs recorded validation loss)."""
+    bt_f, bv_f = _pick_loss_npy(res_dir, "baseline_unet_spleen_b*_losses.npy")
+    xt_f, xv_f = _pick_loss_npy(res_dir, "xconv_unet_spleen_b*_r4_independent_conv_losses.npy")
+    if bt_f is None or xt_f is None:
+        print("loss: missing 600-step train curves", flush=True)
+        return
+    bt, xt = np.load(bt_f), np.load(xt_f)
+    bv = np.load(bv_f) if bv_f else None                 # rows (step, loss)
+    xv = np.load(xv_f) if xv_f else None
+
+    def smooth(a, k=15):
+        if len(a) < k:
+            return a
+        return np.convolve(a, np.ones(k) / k, mode="valid")
+    fig, ax = plt.subplots(figsize=(6.2, 4))
+    ax.plot(np.arange(1, len(bt) + 1)[len(bt) - len(smooth(bt)):], smooth(bt),
+            color=EXACT, lw=1.6, label="conv — train")
+    ax.plot(np.arange(1, len(xt) + 1)[len(xt) - len(smooth(xt)):], smooth(xt),
+            color=XCONV, lw=1.6, label="XConv r=4 — train")
+    if bv is not None and len(bv):
+        ax.plot(bv[:, 0], bv[:, 1], "--o", ms=3, color=EXACT, lw=1.2, label="conv — val")
+    if xv is not None and len(xv):
+        ax.plot(xv[:, 0], xv[:, 1], "--o", ms=3, color=XCONV, lw=1.2, label="XConv r=4 — val")
+    ax.set_xlabel("training step"); ax.set_ylabel("DiceCE loss")
+    ax.set_title("spleen UNet finetune — loss (batch 64, lr 2e-4, 600 steps)")
+    ax.legend(frameon=False, fontsize=9)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    _save(fig, os.path.join(out_dir, "loss_curves"))
+
+
+def _load_for_inference(dataset_dir, ckpt_path, device):
+    """A plain UNet with finetuned weights loaded. XConv's FORWARD is the exact conv
+    (it only changes the weight gradient), so a plain conv net reproduces either
+    model's predictions exactly; any extra XConv buffers are ignored (strict=False)."""
+    net = B.bare_net(dataset_dir, device)
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+    net.load_state_dict(sd, strict=False)
+    net.eval()
+    return net
+
+
+def _fg_dice(pred, gt):  # both (1,H,W,D) class-index maps; foreground = spleen (>0)
+    p, g = (pred[0] > 0).float(), (gt[0] > 0).float()
+    return float(2 * (p * g).sum() / (p.sum() + g.sum() + 1e-8))
+
+
+def segmentation_comparison(dataset_dir, out_dir, device, n_volumes=3, n_slices=4):
+    """Per-slice GT │ conv │ XConv predicted-spleen overlays on held-out volumes,
+    from the two finetuned checkpoints (results/checkpoints/). One figure per volume,
+    annotated with each model's foreground Dice — the qualitative companion to the
+    headline 'same accuracy at less memory' claim."""
+    ck = os.path.join(_HERE, "results", "checkpoints")
+    pick = lambda stem: (sorted(glob.glob(os.path.join(ck, stem)), key=os.path.getmtime) or [None])[-1]
+    conv_ckpt = pick("baseline_unet_spleen_b*.pth")
+    xconv_ckpt = pick("xconv_unet_spleen_b*_r4_independent_conv.pth")
+    if not conv_ckpt or not xconv_ckpt:
+        print("seg_compare: missing checkpoints under results/checkpoints/ "
+              "(run finetune with --save_ckpt 1)", flush=True)
+        return
+    print(f"seg_compare: conv={os.path.basename(conv_ckpt)} "
+          f"xconv={os.path.basename(xconv_ckpt)}", flush=True)
+    seg_dir = os.path.join(out_dir, "segmentation")
+    os.makedirs(seg_dir, exist_ok=True)
+    m_conv = _load_for_inference(dataset_dir, conv_ckpt, device)
+    m_xconv = _load_for_inference(dataset_dir, xconv_ckpt, device)
+    for vi, batch in enumerate(B.val_loader(dataset_dir, n_volumes, 0)):
+        img = batch["image"].to(device)
+        lbl = batch["label"][0].cpu().float()                  # (1,H,W,D)
+        with torch.no_grad():
+            lc = sliding_window_inference(img, (96, 96, 96), 4, m_conv, overlap=0.25)
+            lx = sliding_window_inference(img, (96, 96, 96), 4, m_xconv, overlap=0.25)
+        pc = torch.argmax(lc, 1, keepdim=True)[0].cpu().float()
+        px = torch.argmax(lx, 1, keepdim=True)[0].cpu().float()
+        ct = img[0].cpu().float()
+        dc, dx = _fg_dice(pc, lbl), _fg_dice(px, lbl)
+        sums = lbl[0].sum(dim=(0, 1))
+        zsel = sorted(int(z) for z in torch.argsort(sums, descending=True)[:n_slices]
+                      if sums[int(z)] > 0)
+        if not zsel:
+            continue
+        cols = [("ground truth", lbl), ("conv (exact)", pc), ("XConv r=4", px)]
+        fig, ax = plt.subplots(len(zsel), 3, figsize=(9, 3 * len(zsel)))
+        ax = np.atleast_2d(ax)
+        for r, z in enumerate(zsel):
+            ct_s = ct[:, :, :, z]
+            for c, (name, vol) in enumerate(cols):
+                bimg = blend_images(ct_s, vol[:, :, :, z], alpha=0.5, cmap="hsv",
+                                    rescale_arrays=True)
+                ax[r, c].imshow(np.transpose(_to_rgb(bimg), (1, 0, 2)), origin="lower")
+                ax[r, c].axis("off")
+                if r == 0:
+                    ax[r, c].set_title(name)
+            ax[r, 0].text(-0.06, 0.5, f"z={z}", transform=ax[r, 0].transAxes,
+                          rotation=90, va="center", ha="right", fontsize=9)
+        fig.suptitle(f"held-out volume {vi + 1} — foreground Dice:  "
+                     f"conv {dc:.3f}  ·  XConv r=4 {dx:.3f}", y=1.0, fontsize=11)
+        _save(fig, os.path.join(seg_dir, f"volume_{vi + 1}"))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_dir", default=os.path.join(_HERE, "data", "Task09_Spleen"))
@@ -127,13 +250,28 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--compare_only", action="store_true")
     p.add_argument("--seg_only", action="store_true")
+    p.add_argument("--loss_only", action="store_true")
+    p.add_argument("--seg_compare", action="store_true",
+                   help="per-slice GT|conv|XConv overlays from the two finetuned checkpoints")
     a = p.parse_args()
+    res = os.path.join(_HERE, "results")
     os.makedirs(a.out_dir, exist_ok=True)
+    if a.loss_only:
+        os.makedirs(os.path.join(a.out_dir, "loss"), exist_ok=True)
+        loss_figure(res, os.path.join(a.out_dir, "loss"))
+        return
+    if a.seg_compare:
+        dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
+        segmentation_comparison(a.dataset_dir, a.out_dir, dev)
+        return
     if not a.compare_only:
         dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
         segmentation_figures(a.dataset_dir, a.out_dir, dev)
+        segmentation_comparison(a.dataset_dir, a.out_dir, dev)
     if not a.seg_only:
-        comparison_figure(os.path.join(_HERE, "results"), a.out_dir)
+        comparison_figure(res, a.out_dir)
+        os.makedirs(os.path.join(a.out_dir, "loss"), exist_ok=True)
+        loss_figure(res, os.path.join(a.out_dir, "loss"))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=60)
     p.add_argument("--lr", type=float, default=0.0)        # 0 -> bundle lr (0.002); else override
     p.add_argument("--val_volumes", type=int, default=5)   # held-out volumes for Dice
+    p.add_argument("--val_every", type=int, default=20)    # steps between val-loss evals (0=off)
+    p.add_argument("--save_ckpt", type=int, default=1)     # save finetuned state_dict
     p.add_argument("--mem_budget_gb", type=float, default=15.0)
     p.add_argument("--dataset_dir", default=os.path.join(_HERE, "data", "Task09_Spleen"))
     p.add_argument("--num_workers", type=int, default=4)
@@ -123,10 +125,11 @@ def main():
     print(f"[memory] {a.method} peak {peak_mib:.0f} MiB (torch_peak, 2-iter, batch={a.batch})")
 
     # --- 5) finetune, proving the convs actually move (memory already measured) ---
+    val_batch = B.fixed_val_patches(a.dataset_dir, 8, device) if a.val_every else None
     print(f"[finetune] {a.method} {a.max_steps} steps (batch={a.batch}"
           + (f", r={a.ps}" if a.method == "xconv" else "") + ")")
     hist = engine.finetune(model, loader, loss_fn, optimizer, a.max_steps, device,
-                           scheduler=scheduler)
+                           scheduler=scheduler, val_batch=val_batch, val_every=a.val_every)
     deltas = list(xc.conv_update_deltas(model, init).values())
     gate = 1e-4  # bundle Novograd has no weight decay, so any motion is gradient-driven
     conv_update = {"min": min(deltas), "max": max(deltas), "mean": sum(deltas) / len(deltas),
@@ -146,6 +149,14 @@ def main():
     losses = hist["losses"]
     np.save(os.path.join(a.out_dir, run_name(a) + "_losses.npy"),
             np.asarray(losses, dtype=np.float32))
+    if hist.get("val_losses"):
+        np.save(os.path.join(a.out_dir, run_name(a) + "_val_losses.npy"),
+                np.asarray(hist["val_losses"], dtype=np.float32))   # rows: (step, loss)
+    if a.save_ckpt:
+        ckpt_dir = os.path.join(a.out_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, run_name(a) + ".pth"))
+        print(f"[ckpt] saved {run_name(a)}.pth")
     result = {
         "method": a.method, "run_name": run_name(a),
         "recipe": {"optimizer": "Novograd", "lr": lr, "scheduler": "StepLR(5000,0.1)",

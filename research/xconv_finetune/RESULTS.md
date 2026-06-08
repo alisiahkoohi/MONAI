@@ -83,15 +83,29 @@ conv weights move during finetuning.
 
 ---
 
-## Figures (`results/figures/`, vector PDF + PNG @ 300 dpi)
+## Figures — directory guide (`results/figures/`, vector PDF + PNG @ 300 dpi)
 
-| file | content |
-|---|---|
-| `segmentation_panel.{pdf,png}` | input CT │ ground-truth overlay │ prediction overlay (MONAI `blend_images`), most-spleen axial slice |
-| `segmentation_3d.{pdf,png}` | axial-slice grid with predicted spleen overlay (MONAI `matshow3d`) |
-| `comparison.{pdf,png}` | peak memory + Dice bars: exact vs XConv r=4 (600 st) vs XConv r=512 (60 st) |
+| path | content | status |
+|---|---|---|
+| `comparison.{pdf,png}` | peak memory + Dice bars: exact vs XConv r=4 (600 st) vs XConv r=512 (60 st) | done |
+| `segmentation_panel.{pdf,png}` | input CT │ GT overlay │ prediction overlay (MONAI `blend_images`), most-spleen slice | done |
+| `segmentation_3d.{pdf,png}` | axial-slice grid with predicted spleen overlay (MONAI `matshow3d`) | done |
+| `loss/loss_curves.{pdf,png}` | training loss vs step, conv=blue / XConv r=4=red (15-step smoothed); val-loss dashed when available | **train done; val pending** |
+| `segmentation/` | per-slice GT │ conv │ XConv prediction comparison, a few test volumes | **pending GPU** |
 
-Built by `visualize.py` (uses MONAI's own visualization utilities).
+Built by `visualize.py` (`--loss_only`, `--compare_only`, `--seg_only`; uses MONAI's
+own viz). The training-loss plot is data-only (CPU).
+
+**Pending a free GPU** (code is in place — `run.py --val_every` + saved checkpoints
+under `results/checkpoints/`, and the per-model segmentation viz). A 600-step 3D-UNet
+re-run + sliding-window inference is impractical on CPU. To produce them:
+
+```bash
+python run.py --method baseline --batch 64 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 5
+python run.py --method xconv    --batch 64 --ps 4 --lr 0.0002 --max_steps 600 --val_every 20 --val_volumes 5
+python visualize.py --loss_only          # adds the validation dashed lines
+# (conv-vs-xconv per-slice segmentation viz from the two saved checkpoints)
+```
 
 ---
 
